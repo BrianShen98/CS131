@@ -1,250 +1,349 @@
-import asyncio
-import re
-import string
-import sys
-import time
+import sys,time
 import json
-import logging
+import asyncio
+import functools
+from iso6709 import Location
+name_to_port = {
+    'Alford':19530,
+    'Ball':19531,
+    'Hamilton':19532,
+    'Holiday':19533,
+    'Welsh':19534
 
-repo = {}
+}
 
-def name_to_port(name):
-	return{
-		'Alford': 19530,
-		'Hamilton': 19531,
-		'Holiday': 19532,
-		'Ball': 19533,
-		'Welsh': 19534
-	}.get(name, -1)
+propagation_rules = {
+    'Alford':['Hamilton','Welsh'],
+    'Ball':['Holiday','Welsh'],
+    'Hamilton':['Alford','Holiday'],
+    'Holiday':['Ball','Hamilton'],
+    'Welsh':['Alford','Ball']
+}
 
-def socketMatch(socket):
-	return{
-		19530: 'Alford',
-		19531: 'Hamilton',
-		19532: 'Holiday',
-		19533: 'Ball',
-		19534: 'Welsh'
-	}.get(socket)
+command_length = {
+    'IAMAT':4,
+    'WHATSAT':4
+}
 
-def propagation_rules(name):
-	return{
-		'Alford': (19534, 19531),
-		'Hamilton': (19530, 19532),
-		'Holiday': (19531, 19533),
-		'Ball': (19532, 19534),
-		'Welsh': (19533, 19530)
-	}.get(name)
+#keep track of the clients the server receive requests from
+clients_list = {}
 
-def check_IAMAT(s):
-	regex = re.compile(r"""IAMAT\n
-							(.*)\n
-							[+-]\d+\.\d+[+-]\d+\.\d+\n
-							\d+\.\d{9}""", re.VERBOSE)
-	result = regex.fullmatch(s)
-	if(not result):
-		return False
-	for chr in result.group(1):
-		if chr in string.whitespace:
-			return False
-	return True
+#create a protocol for server and client communication
+class ClientServerProtocol(asyncio.Protocol):
+    def __init__(self,name,loop):
+        self.name = name
+        #keep the most recent client request in the format {client:  [loc, time,server_response]}  and for serer-server communication, send the original servername with the response
+        self.loop = loop
+        self.fd = open(name + ".txt","a")
 
-def check_WHATSAT(s):
-	regex = re.compile(r"""WHATSAT\n
-							(.*)\n
-							(\d*)\n
-							(\d*)""", re.VERBOSE)
-	result = regex.fullmatch(s)
-	if(not result):
-		return False
-	for chr in result.group(1):
-		if chr in string.whitespace:
-			return False
-	if int(result.group(2)) > 50 or int(result.group(3)) > 20:
-		return False
-	return True
+            
+    def connection_made(self,transport):
+        self.peername = transport.get_extra_info('peername')        
+        self.fd.write("{}: Connected with client {}.\n".format(self.name,self.peername))
+        #can used for getting extra info
+        self.transport = transport
+        
+    def data_received(self,data):
+        try:
+            req = data.decode()
+            req_list =req.split()
+        except UnicodeDecodeError:
+            self.transport.write("? \n".encode())
+            self.fd.write("Connection closed by client {}.\n".format(self.peername))            
+            self.fd.close()
+            self.transport.close()
+            return
+        
+        res = ""    
+        if not req_list:
+            self.transport.write("? \n")
+            self.fd.write(self.msg_received(req))
+            self.fd.write("{} responded:? . Error: Empty request.\n")
+            self.fd.close()
+            self.transport.close()
+        
+        
+        elif req_list[0] == "IAMAT" and len(req_list) == command_length['IAMAT']:
+            self.fd.write(self.msg_received(req))
+            self.handle_IAMAT(req_list)
+        elif req_list[0] == "WHATSAT" and len(req_list) == command_length['WHATSAT']:
+            self.fd.write(self.msg_received(req))
+            self.handle_WHATSAT(req_list)
+        elif req_list[0] == "PROP":
+            self.fd.write("{} received flooded message:{}.\n".format(self.name,req))
+            self.handle_PROP(req)
+        else:
+            res = "? "+ req
+            self.transport.write(res.encode())
+            self.fd.write(self.msg_received(req))
+            self.fd.write("{} responded:{}. Error: Invalid name of the command.\n".format(self.name,res))
+            self.fd.close()
+            self.transport.close()
 
-def check_TCPMessage(msg):
-	l = msg.split()
-	length = len(l)
-	if length == 6 and l[0] == 'AT':
-		return True
-	elif length == 4:
-		if l[0] == 'IAMAT':
-			return check_IAMAT('\n'.join(msg.split()))
-		elif l[0] == 'WHATSAT':
-			return check_WHATSAT('\n'.join(msg.split()))
-		return False
-	return False
 
-class ServerClientProtocol(asyncio.Protocol):
-	def __init__(self, message, loop): # message in case of client-like
-		self.message = message # None for server-like
-		self.loop = loop
-		
-	def connection_made(self, transport):
-		if not self.message: # server
-			self.transport = transport
-			self.socket = transport.get_extra_info('sockname')[1]
-			self.name = socketMatch(self.socket)
-			peername = transport.get_extra_info('peername')
-			logging.info('{}: connection from {}'.format(self.name, peername))
-		else: # client
-			self.transport = transport
-			transport.write(self.message.encode())
+    def msg_received(self,msg):
+        return "{} received:{}.\n".format(self.name,msg)
 
-	def _IAMATProcess(self, keywords):
-		id = keywords[1]
-		req_time = float(keywords[3])
-		repoValue = repo.get(id) # get a tuple
-		if  repoValue == None or repoValue[0] <= req_time:
-			timediff = time.time() - req_time
-			timediffstr = format(timediff, '.9f')
-			timestamp = '+'+timediffstr if timediff >= 0 else timediffstr
-			ATstr = 'AT ' + self.name + ' ' + timestamp + ' ' + \
-						' '.join([keywords[i] for i in range(1, 4)]) + '\r\n'
-			repo[id] = (req_time, ATstr)
-			return ATstr
-		return repoValue[1]
+    def handle_IAMAT(self,message):
+        # send PROP to other server
+        res = ""
+        clientID = message[1]
+        loc = message[2]
+        req_time = message[3]
+        res_time = time.time()
+        
+        #check the format of the location
+        if not check_loc(loc):
+            res = err_msg(message)
+            self.fd.write("{} responded:{}. Error: The location is not in ISO 6709 fromat.\n".format(self.name,res))
+            self.fd.close()
+        #check the format of POSIX time
+        elif not check_time(req_time):
+            res = err_msg(message)
+            self.fd.write("{} responded:{}. Error: The timestamp is not in POSIX time fromat.\n".format(self.name,res))
+            self.fd.close()
+        else:        
+            time_diff = str(res_time - float(req_time))
+            if '-' not in  time_diff:
+                time_diff = '+' + time_diff
+            res = 'AT '+self.name+' ' + time_diff + ' ' + ' '.join(message[1:])+'\n'
+            self.fd.write("{} responded:{}.\n".format(self.name,res))
+            #flood the newest info to other servers
+            asyncio.ensure_future(self.flooding("PROP "+res+" "+req_time),loop = self.loop)
+            #update communication records
+            lag_longi = get_loc(loc)
+            lag_longi.extend([req_time,res])
+            if clientID in clients_list:
+                old_time = clients_list[clientID][2]
+                if float(req_time) > float(old_time):
+                    clients_list[clientID] = lag_longi
+                   
+            else:
+                clients_list[clientID] = lag_longi
+            
+        self.transport.write(res.encode())        
+        self.transport.close()
+        
+    def handle_WHATSAT(self,message):    
+        clientID = message[1]
+        res = ""
+        try:
+            radius = float(message[2])
+            infobd = int(message[3])
+        except ValueError:
+            res = err_msg(message)
+            self.fd.write("{} responded:{}. Error: Cannot recognize radius or information bound.\n".format(self.name,res))
+            self.fd.close()
+            self.transport.write(res.encode())
+            self.transport.close()
+            return
+        
 
-	async def flooding(self, ATString):
-		for socket in propagation_rules(self.name):
-			try:
-				coro = self.loop.create_connection(lambda: ServerClientProtocol(ATString, self.loop), '127.0.0.1', socket)
-				await self.loop.create_task(coro)
-			except ConnectionRefusedError as e:
-				logging.info('{} flooding stopped: to {}, {}'.format(self.name, socketMatch(socket), e))
-			else:
-				logging.info('{} floods: to {}'.format(self.name, socketMatch(socket)))
+        #error check
+        if radius > 50 or radius < 0:
+            res =  err_msg(message)
+            self.fd.write("{} responded:{}. Error: Radius out of bound.\n".format(self.name,res))
+            self.fd.close()
+            self.transport.write(res.encode())
+            self.transport.close()
+        elif infobd > 20 or infobd < 0:            
+            res =  err_msg(message)
+            self.fd.write("{} responded:{}. Error: Information bound out of bound.\n".format(self.name,res))
+            self.fd.close()
+            self.transport.write(res.encode())
+            self.transport.close()
+        else:            
+            #ask Google place to parse 
+            if clientID in clients_list:
+                #since the loop is already running,it will start the func until await
+                task = asyncio.ensure_future(self.req_google(clients_list[clientID][0],clients_list[clientID][1],radius),loop = self.loop)
+            
+                task.add_done_callback(functools.partial(self.process_json,clientID,infobd))
+            else:
+                #the client being queried does not exist
+                res = err_msg(message)
+                self.fd.write("{} responded:{}. Error: The client asked for does not exist.\n".format(self.name,res))
+                self.fd.close()
+                self.transport.write(res.encode())
+                self.transport.close()
+                
 
-	def getProcess(self, radius, geo):
-		radius *= 1000 #kilos to meters
-		regex = re.compile(r'([+-]\d+\.\d+)([+-]\d+\.\d+)')
-		result = regex.match(geo)
-		geo1 = result.group(1)
-		geo2 = result.group(2)
-		uri = \
-			'/maps/api/place/nearbysearch/json?location='+geo1+','+geo2+\
-			'&radius='+str(radius)+\
-			'&key=AIzaSyCqDjGGjA4UxSHo_GXa_MUdVfvTPkdJqDc'
-		getRequest = \
-			'GET ' + uri + ' HTTP/1.1\r\n' +\
-			'Host: ' + 'maps.googleapis.com\r\n' +\
-			'Content-Type: text/plain; charset=utf-8\r\n' +\
-			'Connection: close\r\n\r\n'
-		logging.info('getRequest:\n{}'.format(getRequest))
-		return getRequest
+    #format of PROP: "PROP ORIGINS RESPONSE REQ_TIME"
+    async def flooding(self,proped_msg):
+        root = ""
+        #parse proped_msg to find origins
+        try:
+            AT_idx = proped_msg.index("AT")
+            origins = proped_msg[5:AT_idx].split()
+            if not origins:
+                root = self.name+" "
+        except ValueError:        
+            return
+        
+        flood_list = [target for target in propagation_rules[self.name] if target not in origins]
+        #form new PROP msg
+        msg = proped_msg[:AT_idx] + root + ' '.join(flood_list)+" "+proped_msg[AT_idx:]
+        
+        #flood to targets
+        for target in flood_list:
+            try:
+                self.fd.write("{}:try to flood to {}.\n".format(self.name,target))
+                connection = asyncio.open_connection('127.0.0.1',name_to_port[target],loop = self.loop)
+                (reader,writer) = await connection        
+                writer.write(msg.encode())
+                await writer.drain()            
+                writer.close()
 
-	async def googleAPI(self, getRequest, bound):
-		reader, writer = await asyncio.open_connection('maps.googleapis.com', 443, ssl=True, loop=self.loop)
-		writer.write(getRequest.encode())
-		await writer.drain()
+            except ConnectionRefusedError:
+                self.fd.write("{}:{} is offline.\n".format(self.name,target))            
+                continue
+            else:
+                self.fd.write("{}:flooded to {}.\n".format(self.name,target))
+        self.fd.close()
 
-		data = await reader.read()
-		message = data.decode()
-		getjson = json.loads(message[message.find("{"):])
-		getjson['results'] = len(getjson['results']) <= bound and getjson['results'] or getjson['results'][:bound]
-		jsonOutput = json.dumps(getjson, indent=4, sort_keys=True, separators=(',', ': ')) + '\n\n'
-		
-		writer.close()
+        
+    def handle_PROP(self,req):
+        #parse
+        try:
+            AT_idx = req.index("AT")
+            time_idx = req.rindex(" ")
+            msg = req[AT_idx:time_idx]
+            msg_list = msg.split()
+            req_time = req[time_idx+1:]            
+            client = msg_list[3]
+            lag_longi = get_loc(msg_list[4])
+            lag_longi.extend([req_time,msg])
+            
+        except ValueError:
+            return
 
-		self.transport.write(jsonOutput.encode())
-		logging.info('{}: close the client socket'.format(self.name))
-		self.transport.close()
+        #update the clients info
+        if client in clients_list:
+            old_time = clients_list[client][2]
+            if(float(req_time) >= float(old_time)):
+                clients_list[client] = lag_longi
+        else:
+            clients_list[client] = lag_longi
 
-	def _errorHandler(self, message):
-		errorMessage = '? '+message
-		logging.info('{} reported error: {!r}'.format(self.name, errorMessage))
-		self.transport.write(errorMessage.encode())
+        #flood to others
+        asyncio.ensure_future(self.flooding(req),loop = self.loop)
+        
 
-	def data_received(self, data):
-		try:
-			message = data.decode() ## TODO: special char cannot be decoded like \c
-		except UnicodeDecodeError as e:
-			self.transport.write('? '.encode())
-			self.transport.write(data)
-			logging.info('{}: cannot debug received data by utf-8'.format(self.name))
-			return
-		logging.info('{} received: {!r}'.format(self.name, message))
-		if check_TCPMessage(message):
-			keywords = message.split()
-			command = keywords[0]
-			if command == 'IAMAT':
-				# respond with AT message
-				ATString = self._IAMATProcess(keywords)
-				logging.info('{} responded: {!r}'.format(self.name, ATString))
-				self.transport.write(ATString.encode())
+    async def req_google(self,lag,longi,radius):
+        api_key = "AIzaSyCqDjGGjA4UxSHo_GXa_MUdVfvTPkdJqDc"
+        host = "maps.googleapis.com"
+        uri = "/maps/api/place/nearbysearch/json?location={}&radius={}&key={}".format(lag+","+longi,radius*1000,api_key)
+        try:
+            connection = asyncio.open_connection(host,443,ssl=True,loop = self.loop)
+            (reader,writer) = await connection
+            self.fd.write("{}:Try to connect to Google.\n".format(self.name))
+        except ConnectionRefusedError:
+            self.fd.write("{}:Failed to connect to Google.\n".format(self.name))
+            return
+        else:
+            req = "GET {} HTTP/1.1\r\nHost: {}\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n\r\n".format(uri,host)
+            self.fd.write("{}:Connection established. Send request:{}".format(self.name,req))
+            writer.write(req.encode())
+            await writer.drain()
+            #discard the header
+            head = await reader.readuntil("\r\n\r\n".encode())
+            body = await reader.readuntil("\r\n\r\n".encode())
+            writer.close()
+        
+            return body.decode()
+        
 
-				# spread message to herd
-				self.loop.create_task(self.flooding(ATString))
-				logging.info('{}: close the client socket'.format(self.name))
-				self.transport.close()
+    def process_json(self,clientID,infobd,future):
+        body = future.result()    
+        if not body:
+            self.transport.close()
+            self.fd.close()
+            return
+        
+        places = body[body.index('{'):body.rindex('}')+1]
 
-			elif command == 'WHATSAT':
-				id = keywords[1]
-				repoValue = repo.get(id)
-				if not repoValue:
-					# id not found
-					self._errorHandler(message)
-					logging.info('{}: close the client socket'.format(self.name))
-					self.transport.close()
-				else:
-					# respond with AT message after found
-					ATString = repoValue[1]
-					logging.info('{} responded: {!r}'.format(self.name, ATString))
-					self.transport.write(ATString.encode())
-					getRequest = self.getProcess(int(keywords[2]), ATString.split()[4])
-					self.loop.create_task(self.googleAPI(getRequest, int(keywords[3])))
+        #eliminate adjacent new lines
+        temp1 = places;
+        temp2 = temp1.replace('\n\n','\n')
+        while temp1 != temp2:
+            temp1 = temp2
+            temp2 = temp1.replace('\n\n','\n')
+        places = temp2
 
-			else: # get AT message
-				id = keywords[3]
-				repoValue = repo.get(id)
-				req_time = float(keywords[5])
-				if not repoValue or (req_time > repoValue[0]):
-					logging.info('repotime: {}, messagetime: {}' .format(-1 if not repoValue else repoValue[0], req_time))
-					repo[id] = (req_time, message)
-					self.loop.create_task(self.flooding(message))
-				logging.info('{}: close the client socket'.format(self.name))
-				self.transport.close()
-		
-		else:
-			# wrong format message
-			self._errorHandler(message)
-			logging.info('{}: close the client socket'.format(self.name))
-			self.transport.close()
-		
-	def connection_lost(self, _):
-		if self.message: # a client, whose message is not None
-			self.transport.close()
+        #select limited results
+        
+        obj = json.loads(places,strict = False)
+        obj['results'] = obj['results'] if len(obj['results']) <= infobd else obj['results'][:infobd]
+        
+        #form response
+        res = clients_list[clientID][3] + json.dumps(obj,indent = 3,separators=(',',': '))+'\n\n'
+        self.fd.write("{} responded:{}".format(self.name,clients_list[clientID][3]))
+        self.fd.close()
+        self.transport.write(res.encode())
+        self.transport.close()
 
+        
+def err_msg(msg):
+        return '? '+ ' '.join(msg)+'\n'
+    
+#check the format of ISO6079 location
+def check_loc(loc):
+    try:
+        laglongi = Location(loc)
+    except AttributeError:
+        return False
+
+    return True
+    # if loc.count("+") + loc.count("-") != 2:
+    #     return False
+    # lag_longi = loc.replace("+"," +").replace("-"," -").split()    
+    # try:
+    #     lag = float(lag_longi[0])
+    #     longi = float(lag_longi[1])
+    # except ValueError:
+    #     return False
+    # return True
+
+def get_loc(loc):
+    location = Location(loc)
+    return [str(location.lat.degrees), str(location.lng.degrees)]
+
+#check POSIX time            
+def check_time(time):
+    try:
+        if float(time) < 0:
+            return False
+    except ValueError:
+        return False
+    return True
+            
+        
 def main():
-	if len(sys.argv) != 2:
-		print ('Invalid number of paramaters: Only 1 arg')
-		return
-	name = sys.argv[1]
-	socket = name_to_port(name)
-	if socket == -1:
-		print ('Invalid server name')
-		return
-	
-	logging.basicConfig(filename='{}.log'.format(name), level=logging.INFO)
-	
-	loop = asyncio.get_event_loop()
-	loop.set_debug(True)
-	# Each client connection will create a new protocol instance
-	coro = loop.create_server(lambda: ServerClientProtocol(None, loop), '127.0.0.1', socket)
-	server = loop.run_until_complete(coro)
+    if(len(sys.argv) != 2):
+        print("Please privide a valid server name!")
+        
+    else:
+        server_name = sys.argv[1]
+        loop = asyncio.get_event_loop()
+        #since create_server() is a coroutine function, this will return a coroutine object
+        try:
+            coro = loop.create_server(lambda:ClientServerProtocol(server_name,loop),'127.0.0.1',name_to_port[server_name])
+        except KeyError:
+            print("The server name does not exist!")
+            return
+        
+        #may be add the coroutine object into the loop and initialize it
+        server = loop.run_until_complete(coro)
+        
+        try:
+            loop.run_forever()
+        except KeyboardInterrupt:
+            pass
+        
+        server.close()
+        loop.run_until_complete(server.wait_closed())
+        loop.close()
 
-	# Serve requests until Ctrl+C is pressed
-	logging.info('{}: serving on {}'.format(name, socket))
-	try:
-		loop.run_forever()
-	except KeyboardInterrupt:
-		pass
-
-	# Close the server
-	server.close()
-	loop.run_until_complete(server.wait_closed())
-	loop.close()
-
-if __name__ == '__main__':
-	main()
+if __name__ == "__main__":
+    main()
+    
